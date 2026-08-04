@@ -1,8 +1,13 @@
 import { google } from "googleapis";
+import { redis } from "./redis";
 
 const SPREADSHEET_ID = process.env.SHEET_ID as string;
 const MASTER_SHEET = "master_tracking";
 const LOG_SHEET = "log_historical";
+
+const MASTER_CACHE_KEY = "master_tracking:rows";
+const MASTER_CACHE_TTL_SEC = 60;
+const GENERATED_SET_KEY = "log_historical:resi_set";
 
 function getAuth() {
   const clientEmail = process.env.GOOGLE_CLIENT_EMAIL;
@@ -30,13 +35,11 @@ export type MasterRow = {
   warehouse: string;
 };
 
-let cache: { rows: MasterRow[]; fetchedAt: number } | null = null;
-const CACHE_TTL_MS = 30_000;
+// L1 cache: survives only within a warm serverless instance.
+let memCache: { map: Map<string, MasterRow>; fetchedAt: number } | null = null;
+const MEM_CACHE_TTL_MS = 15_000;
 
-async function fetchMasterRows(): Promise<MasterRow[]> {
-  if (cache && Date.now() - cache.fetchedAt < CACHE_TTL_MS) {
-    return cache.rows;
-  }
+async function fetchMasterRowsFromSheet(): Promise<MasterRow[]> {
   const sheets = getSheetsClient();
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -55,17 +58,42 @@ async function fetchMasterRows(): Promise<MasterRow[]> {
     if (!resi) continue;
     rows.push({ rowIndex: i + 1, noOrder, channel, service, resi, warehouse });
   }
-  cache = { rows, fetchedAt: Date.now() };
   return rows;
 }
 
-export async function findByResi(resi: string): Promise<MasterRow | null> {
-  const rows = await fetchMasterRows();
-  const target = resi.trim().toUpperCase();
-  return rows.find((r) => r.resi.trim().toUpperCase() === target) ?? null;
+async function getMasterRowsMap(): Promise<Map<string, MasterRow>> {
+  if (memCache && Date.now() - memCache.fetchedAt < MEM_CACHE_TTL_MS) {
+    return memCache.map;
+  }
+
+  let rows: MasterRow[] | null = null;
+
+  if (redis) {
+    const cached = await redis.get<MasterRow[]>(MASTER_CACHE_KEY);
+    if (cached) rows = cached;
+  }
+
+  if (!rows) {
+    rows = await fetchMasterRowsFromSheet();
+    if (redis) {
+      await redis.set(MASTER_CACHE_KEY, rows, { ex: MASTER_CACHE_TTL_SEC });
+    }
+  }
+
+  const map = new Map<string, MasterRow>();
+  for (const row of rows) {
+    map.set(row.resi.trim().toUpperCase(), row);
+  }
+  memCache = { map, fetchedAt: Date.now() };
+  return map;
 }
 
-export async function getGeneratedResiSet(): Promise<Set<string>> {
+export async function findByResi(resi: string): Promise<MasterRow | null> {
+  const map = await getMasterRowsMap();
+  return map.get(resi.trim().toUpperCase()) ?? null;
+}
+
+async function hydrateGeneratedSetFromSheet(): Promise<Set<string>> {
   const sheets = getSheetsClient();
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -78,6 +106,29 @@ export async function getGeneratedResiSet(): Promise<Set<string>> {
     if (resi) set.add(String(resi).trim().toUpperCase());
   }
   return set;
+}
+
+export async function getGeneratedResiSet(): Promise<Set<string>> {
+  if (!redis) {
+    return hydrateGeneratedSetFromSheet();
+  }
+
+  const exists = await redis.exists(GENERATED_SET_KEY);
+  if (!exists) {
+    const set = await hydrateGeneratedSetFromSheet();
+    if (set.size > 0) {
+      const members = Array.from(set) as [string, ...string[]];
+      await redis.sadd(GENERATED_SET_KEY, ...members);
+    } else {
+      // Mark as hydrated even when empty so we don't re-scan the sheet every call.
+      await redis.sadd(GENERATED_SET_KEY, "__init__");
+      await redis.srem(GENERATED_SET_KEY, "__init__");
+    }
+    return set;
+  }
+
+  const members = await redis.smembers(GENERATED_SET_KEY);
+  return new Set(members.map((m) => m.toUpperCase()));
 }
 
 export async function appendToLogHistorical(
@@ -93,6 +144,11 @@ export async function appendToLogHistorical(
     valueInputOption: "USER_ENTERED",
     requestBody: { values },
   });
+
+  if (redis) {
+    const resiUpper = entries.map((e) => e.resi.trim().toUpperCase()) as [string, ...string[]];
+    await redis.sadd(GENERATED_SET_KEY, ...resiUpper);
+  }
 }
 
 export async function ensureLogHistoricalSheet() {
