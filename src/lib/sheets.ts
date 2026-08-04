@@ -93,6 +93,11 @@ export async function findByResi(resi: string): Promise<MasterRow | null> {
   return map.get(resi.trim().toUpperCase()) ?? null;
 }
 
+export async function getAllMasterRows(): Promise<MasterRow[]> {
+  const map = await getMasterRowsMap();
+  return Array.from(map.values()).sort((a, b) => b.rowIndex - a.rowIndex);
+}
+
 async function hydrateGeneratedSetFromSheet(): Promise<Set<string>> {
   const sheets = getSheetsClient();
   const res = await sheets.spreadsheets.values.get({
