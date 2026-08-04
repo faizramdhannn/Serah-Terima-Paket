@@ -52,7 +52,12 @@ const styles = StyleSheet.create({
   cellService: { width: "10%", padding: 2 },
   cellWh: { width: "24%", padding: 2 },
   headerCell: { fontFamily: "Times-Bold" },
-  signaturesWrap: { flexDirection: "row", marginTop: 18, flexWrap: "wrap" },
+  signaturesWrap: {
+    flexDirection: "row",
+    justifyContent: "center",
+    marginTop: 18,
+    flexWrap: "wrap",
+  },
   sigBox: { width: "25%", textAlign: "center", paddingHorizontal: 4, marginBottom: 12 },
   sigLabel: { fontSize: 8 },
   sigName: { fontSize: 8, fontFamily: "Times-Bold", marginBottom: 26 },

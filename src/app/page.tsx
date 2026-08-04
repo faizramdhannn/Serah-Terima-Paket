@@ -9,13 +9,13 @@ type ScanItem = {
   warehouse: string;
   channel: string;
   service: string;
+  status: "pending" | "ready";
 };
 
 export default function Home() {
   const [resiInput, setResiInput] = useState("");
   const [items, setItems] = useState<ScanItem[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -30,8 +30,16 @@ export default function Home() {
       return;
     }
 
-    setLoading(true);
     setError(null);
+    // Show the row immediately (optimistic) and free the input right away so
+    // the next resi can be scanned without waiting for this one to resolve.
+    setItems((prev) => [
+      ...prev,
+      { resi, noOrder: "", ekspedisi: "", warehouse: "", channel: "", service: "", status: "pending" },
+    ]);
+    setResiInput("");
+    inputRef.current?.focus();
+
     try {
       const res = await fetch("/api/lookup-resi", {
         method: "POST",
@@ -40,16 +48,16 @@ export default function Home() {
       });
       const data = await res.json();
       if (!res.ok) {
+        setItems((prev) => prev.filter((i) => i.resi !== resi));
         setError(data.error || "Gagal memproses resi");
         return;
       }
-      setItems((prev) => [...prev, data]);
-      setResiInput("");
+      setItems((prev) =>
+        prev.map((i) => (i.resi === resi ? { ...data, status: "ready" } : i))
+      );
     } catch {
-      setError("Gagal terhubung ke server");
-    } finally {
-      setLoading(false);
-      inputRef.current?.focus();
+      setItems((prev) => prev.filter((i) => i.resi !== resi));
+      setError(`Gagal memproses resi "${resi}" — cek koneksi`);
     }
   }
 
@@ -57,8 +65,11 @@ export default function Home() {
     setItems((prev) => prev.filter((i) => i.resi !== resi));
   }
 
+  const readyItems = items.filter((i) => i.status === "ready");
+  const hasPending = items.some((i) => i.status === "pending");
+
   async function handleGenerate() {
-    if (items.length === 0) return;
+    if (readyItems.length === 0) return;
     // Open the tab synchronously (within the click handler) so popup blockers allow it.
     const printWindow = window.open("", "_blank");
     setGenerating(true);
@@ -67,7 +78,7 @@ export default function Home() {
       const res = await fetch("/api/generate-pdf", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ items }),
+        body: JSON.stringify({ items: readyItems }),
       });
       if (!res.ok) {
         const data = await res.json();
@@ -125,14 +136,12 @@ export default function Home() {
             onChange={(e) => setResiInput(e.target.value)}
             placeholder="Scan / ketik nomor resi..."
             className="flex-1 rounded-lg border border-zinc-300 px-4 py-3 text-sm font-mono focus:border-[#0f9b8e] focus:outline-none focus:ring-1 focus:ring-[#0f9b8e] dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
-            disabled={loading}
           />
           <button
             type="submit"
-            disabled={loading}
-            className="rounded-lg bg-[#0f9b8e] px-5 text-sm font-medium text-white transition-colors hover:bg-[#0c7d73] disabled:opacity-50"
+            className="rounded-lg bg-[#0f9b8e] px-5 text-sm font-medium text-white transition-colors hover:bg-[#0c7d73]"
           >
-            {loading ? "..." : "Tambah"}
+            Tambah
           </button>
         </form>
 
@@ -165,14 +174,27 @@ export default function Home() {
                 </tr>
               )}
               {items.map((item, idx) => (
-                <tr key={item.resi} className="border-t border-zinc-200 dark:border-zinc-800">
+                <tr
+                  key={item.resi}
+                  className={`border-t border-zinc-200 dark:border-zinc-800 ${
+                    item.status === "pending" ? "opacity-50" : ""
+                  }`}
+                >
                   <td className="px-2 py-1">{idx + 1}</td>
                   <td className="px-2 py-1 font-mono">{item.resi}</td>
-                  <td className="px-2 py-1">{item.noOrder || "-"}</td>
-                  <td className="px-2 py-1">{item.ekspedisi}</td>
-                  <td className="px-2 py-1">{item.channel || "-"}</td>
-                  <td className="px-2 py-1">{item.service || "-"}</td>
-                  <td className="px-2 py-1">{item.warehouse || "-"}</td>
+                  {item.status === "pending" ? (
+                    <td colSpan={5} className="px-2 py-1 italic text-zinc-400">
+                      Mengecek...
+                    </td>
+                  ) : (
+                    <>
+                      <td className="px-2 py-1">{item.noOrder || "-"}</td>
+                      <td className="px-2 py-1">{item.ekspedisi}</td>
+                      <td className="px-2 py-1">{item.channel || "-"}</td>
+                      <td className="px-2 py-1">{item.service || "-"}</td>
+                      <td className="px-2 py-1">{item.warehouse || "-"}</td>
+                    </>
+                  )}
                   <td className="px-2 py-1">
                     <button
                       onClick={() => removeItem(item.resi)}
@@ -188,10 +210,13 @@ export default function Home() {
         </div>
 
         <div className="flex items-center justify-between">
-          <span className="text-sm text-zinc-500">{items.length} resi siap digenerate</span>
+          <span className="text-sm text-zinc-500">
+            {readyItems.length} resi siap digenerate
+            {hasPending && " (masih ada yang dicek...)"}
+          </span>
           <button
             onClick={handleGenerate}
-            disabled={items.length === 0 || generating}
+            disabled={readyItems.length === 0 || generating || hasPending}
             className="rounded-lg bg-[#0f9b8e] px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-[#0c7d73] disabled:opacity-50"
           >
             {generating ? "Generating..." : "Generate PDF"}

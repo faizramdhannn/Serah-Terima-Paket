@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { findByResi, getGeneratedResiSet } from "@/lib/sheets";
+import { lookupResi } from "@/lib/sheets";
 import { resolveEkspedisi } from "@/lib/ekspedisi";
 
 export async function POST(req: NextRequest) {
@@ -10,10 +10,7 @@ export async function POST(req: NextRequest) {
     }
     const cleaned = resi.trim();
 
-    const [row, generatedSet] = await Promise.all([
-      findByResi(cleaned),
-      getGeneratedResiSet(),
-    ]);
+    const { row, alreadyGenerated } = await lookupResi(cleaned);
 
     if (!row) {
       return NextResponse.json(
@@ -22,7 +19,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (generatedSet.has(cleaned.toUpperCase())) {
+    if (alreadyGenerated) {
       return NextResponse.json(
         { error: `Resi "${cleaned}" sudah pernah digenerate sebelumnya` },
         { status: 409 }

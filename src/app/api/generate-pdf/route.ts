@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { appendToLogHistorical, getGeneratedResiSet } from "@/lib/sheets";
+import { appendToLogHistorical, findGeneratedResi } from "@/lib/sheets";
 import { buildReceiptPdf, PdfItem } from "@/lib/pdf";
 
 export async function POST(req: NextRequest) {
@@ -10,7 +10,7 @@ export async function POST(req: NextRequest) {
     }
 
     // Re-validate against log_historical to avoid race conditions (double submit).
-    const generatedSet = await getGeneratedResiSet();
+    const generatedSet = await findGeneratedResi(items.map((i) => i.resi));
     const dupes = items.filter((i) => generatedSet.has(i.resi.trim().toUpperCase()));
     if (dupes.length > 0) {
       return NextResponse.json(

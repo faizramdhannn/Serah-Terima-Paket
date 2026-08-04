@@ -39,6 +39,11 @@ export type MasterRow = {
 let memCache: { map: Map<string, MasterRow>; fetchedAt: number } | null = null;
 const MEM_CACHE_TTL_MS = 15_000;
 
+// Tracks whether the Redis generated-resi set has been hydrated from the
+// sheet at least once in this warm instance, so we skip the EXISTS check
+// (one Redis round-trip) on every subsequent call.
+let generatedSetHydrated = false;
+
 async function fetchMasterRowsFromSheet(): Promise<MasterRow[]> {
   const sheets = getSheetsClient();
   const res = await sheets.spreadsheets.values.get({
@@ -61,6 +66,14 @@ async function fetchMasterRowsFromSheet(): Promise<MasterRow[]> {
   return rows;
 }
 
+function buildMasterMap(rows: MasterRow[]): Map<string, MasterRow> {
+  const map = new Map<string, MasterRow>();
+  for (const row of rows) {
+    map.set(row.resi.trim().toUpperCase(), row);
+  }
+  return map;
+}
+
 async function getMasterRowsMap(): Promise<Map<string, MasterRow>> {
   if (memCache && Date.now() - memCache.fetchedAt < MEM_CACHE_TTL_MS) {
     return memCache.map;
@@ -80,10 +93,7 @@ async function getMasterRowsMap(): Promise<Map<string, MasterRow>> {
     }
   }
 
-  const map = new Map<string, MasterRow>();
-  for (const row of rows) {
-    map.set(row.resi.trim().toUpperCase(), row);
-  }
+  const map = buildMasterMap(rows);
   memCache = { map, fetchedAt: Date.now() };
   return map;
 }
@@ -113,10 +123,8 @@ async function hydrateGeneratedSetFromSheet(): Promise<Set<string>> {
   return set;
 }
 
-export async function getGeneratedResiSet(): Promise<Set<string>> {
-  if (!redis) {
-    return hydrateGeneratedSetFromSheet();
-  }
+async function ensureGeneratedSetHydrated(): Promise<void> {
+  if (!redis || generatedSetHydrated) return;
 
   const exists = await redis.exists(GENERATED_SET_KEY);
   if (!exists) {
@@ -129,11 +137,72 @@ export async function getGeneratedResiSet(): Promise<Set<string>> {
       await redis.sadd(GENERATED_SET_KEY, "__init__");
       await redis.srem(GENERATED_SET_KEY, "__init__");
     }
-    return set;
+  }
+  generatedSetHydrated = true;
+}
+
+/**
+ * Checks which of the given resi have already been generated, without
+ * pulling the entire (potentially large) generated-resi set over the wire.
+ */
+export async function findGeneratedResi(resiList: string[]): Promise<Set<string>> {
+  const upper = resiList.map((r) => r.trim().toUpperCase());
+  if (upper.length === 0) return new Set();
+
+  if (!redis) {
+    const fullSet = await hydrateGeneratedSetFromSheet();
+    return new Set(upper.filter((r) => fullSet.has(r)));
   }
 
-  const members = await redis.smembers(GENERATED_SET_KEY);
-  return new Set(members.map((m) => m.toUpperCase()));
+  await ensureGeneratedSetHydrated();
+  const members = upper as [string, ...string[]];
+  const results = await redis.smismember(GENERATED_SET_KEY, members);
+  const found = new Set<string>();
+  results.forEach((isMember, i) => {
+    if (isMember) found.add(upper[i]);
+  });
+  return found;
+}
+
+/**
+ * Combined lookup for the scan flow: resolves the master row and checks
+ * duplicate status in as few Redis round-trips as possible (pipelined when
+ * both reads are needed against Redis).
+ */
+export async function lookupResi(
+  resi: string
+): Promise<{ row: MasterRow | null; alreadyGenerated: boolean }> {
+  const upper = resi.trim().toUpperCase();
+
+  // Master row cache still warm in this instance — only need the dup check.
+  if (memCache && Date.now() - memCache.fetchedAt < MEM_CACHE_TTL_MS) {
+    const generated = await findGeneratedResi([upper]);
+    return { row: memCache.map.get(upper) ?? null, alreadyGenerated: generated.has(upper) };
+  }
+
+  if (!redis) {
+    const map = await getMasterRowsMap();
+    const generated = await findGeneratedResi([upper]);
+    return { row: map.get(upper) ?? null, alreadyGenerated: generated.has(upper) };
+  }
+
+  await ensureGeneratedSetHydrated();
+
+  const pipeline = redis.pipeline();
+  pipeline.get<MasterRow[]>(MASTER_CACHE_KEY);
+  pipeline.sismember(GENERATED_SET_KEY, upper);
+  const [cachedRows, isMember] = (await pipeline.exec()) as [MasterRow[] | null, number];
+
+  let rows = cachedRows;
+  if (!rows) {
+    rows = await fetchMasterRowsFromSheet();
+    await redis.set(MASTER_CACHE_KEY, rows, { ex: MASTER_CACHE_TTL_SEC });
+  }
+
+  const map = buildMasterMap(rows);
+  memCache = { map, fetchedAt: Date.now() };
+
+  return { row: map.get(upper) ?? null, alreadyGenerated: !!isMember };
 }
 
 export async function appendToLogHistorical(
