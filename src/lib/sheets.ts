@@ -151,6 +151,44 @@ export async function appendToLogHistorical(
   }
 }
 
+export type HistoryDoc = {
+  docNo: string;
+  generatedAt: string;
+  totalResi: number;
+  ekspedisiBreakdown: { name: string; count: number }[];
+  items: { resi: string; noOrder: string; ekspedisi: string; warehouse: string }[];
+};
+
+export async function getLogHistory(): Promise<HistoryDoc[]> {
+  const sheets = getSheetsClient();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${LOG_SHEET}!A:F`,
+  });
+  const values = res.data.values ?? [];
+
+  const docsByNo = new Map<string, HistoryDoc>();
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i];
+    const [resi, noOrder, ekspedisi, warehouse, generatedAt, docNo] = row;
+    if (!docNo) continue;
+
+    let doc = docsByNo.get(docNo);
+    if (!doc) {
+      doc = { docNo, generatedAt: generatedAt ?? "", totalResi: 0, ekspedisiBreakdown: [], items: [] };
+      docsByNo.set(docNo, doc);
+    }
+    doc.totalResi += 1;
+    doc.items.push({ resi: resi ?? "", noOrder: noOrder ?? "", ekspedisi: ekspedisi ?? "", warehouse: warehouse ?? "" });
+
+    const entry = doc.ekspedisiBreakdown.find((e) => e.name === ekspedisi);
+    if (entry) entry.count += 1;
+    else doc.ekspedisiBreakdown.push({ name: ekspedisi ?? "-", count: 1 });
+  }
+
+  return Array.from(docsByNo.values()).sort((a, b) => b.generatedAt.localeCompare(a.generatedAt));
+}
+
 export async function ensureLogHistoricalSheet() {
   const sheets = getSheetsClient();
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
